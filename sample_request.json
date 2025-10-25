@@ -1,0 +1,48 @@
+{
+    "records": [
+      {
+        "age_at_diagnosis": 67,
+        "gender": "Male",
+        "race": "White",
+        "ethnicity": "Not Hispanic or Latino",
+        "primary_diagnosis": "Liver cancer",
+        "tumor_grade": "G3",
+        "ajcc_m": "M0",
+        "ajcc_n": "N0",
+        "classification_of_tumor": "Primary",
+        "morphology": "Hepatocellular carcinoma",
+        "tissue_origin": "Liver",
+        "laterality": "Not applicable",
+        "prior_malignancy": "No",
+        "synchronous_malignancy": "No",
+        "cause_of_death": null,
+        "progression_or_recurrence": "No",
+        "disease_response": "Stable Disease",
+        "treatment_types": "Surgery",
+        "therapeutic_agents": "None",
+        "treatment_outcome": "Complete Remission"
+      },
+      {
+        "age_at_diagnosis": 54,
+        "gender": "Female",
+        "race": "Black or African American",
+        "ethnicity": "Hispanic or Latino",
+        "primary_diagnosis": "Breast cancer",
+        "tumor_grade": "G2",
+        "ajcc_m": "M1",
+        "ajcc_n": "N1",
+        "classification_of_tumor": "Recurrent",
+        "morphology": "Invasive ductal carcinoma",
+        "tissue_origin": "Breast",
+        "laterality": "Left",
+        "prior_malignancy": "Yes",
+        "synchronous_malignancy": "No",
+        "cause_of_death": null,
+        "progression_or_recurrence": "Yes",
+        "disease_response": "Partial Response",
+        "treatment_types": "Chemotherapy",
+        "therapeutic_agents": "Doxorubicin",
+        "treatment_outcome": "Ongoing"
+      }
+    ]
+  }  
