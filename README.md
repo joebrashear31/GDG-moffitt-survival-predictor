@@ -1,14 +1,15 @@
-# Moffitt Survival Baseline — Hackathon Starter
+# Moffitt Survival — Brev-Ready (Local + Cloud)
 
-✅ Predict survival **probabilities over time** on `Lab-Rasool/hackathon`  
-⚠️ Not for clinical use
+Research-only survival probabilities at clinical time horizons.
+- Local train/test folders or Hugging Face fallback.
+- Trains Cox (and optional RSF).
+- Exports model for FastAPI serving.
+- Runs on NVIDIA Brev or locally.
 
----
-
-## 🚀 Quickstart
-
+## Local Quickstart
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-python survival_hackathon.py --cv-folds 5
+python survival_hackathon.py --data-dir "~/Desktop/moffitt hackathon/hackathon" --model cox --horizons 90 180 365
+uvicorn serve:app --host 0.0.0.0 --port 8000
