@@ -10,3 +10,14 @@ uvicorn[standard]>=0.30.0
 # Optional; comment out if wheels not available on your base image
 scikit-survival>=0.22.2
 datasets>=3.1.0   # ✅ HuggingFace dataset support
+python-multipart
+SimpleITK
+joblib
+pillow
+torch
+torchvision
+pillow
+tifffile
+imageio
+scikit-image
+scipy
