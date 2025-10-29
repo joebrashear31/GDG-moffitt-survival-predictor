@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-survival_hackathon_rev2.py  (TABULAR-ONLY by default)
-----------------------------------------------------
-This version disables image loading by default and relies **only** on official
-patient IDs and tabular fields present in train/test CSVs.
-
-- New flag: --use-images  (default: off). Turn on explicitly to try WSI features.
-- If images are missing, we skip them gracefully.
-- Keeps: CoxPH (elastic-net), XGBRanker, XGB AFT ensemble, GBR → Ridge blender.
-- Robust target encoding & dtype handling.
-
-Run (tabular-only):
-  python survival_hackathon_rev2.py \
-    --data-dir "~/Desktop/moffitt hackathon /hackathon" \
-    --out predictions.csv \
-    --folds 5 \
-    --verbose
-"""
+# survival_hackathon_rev2.py  (ALWAYS USE IMAGES; reverse match)
 
 import os, json, argparse, warnings, inspect, time
 from typing import List, Tuple, Optional, Dict, Any
@@ -26,15 +9,19 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype, is_bool_dtype
 from pathlib import Path
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
+from scipy.ndimage import binary_opening, binary_closing
 
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.decomposition import PCA
 
 from lifelines import CoxPHFitter
 from lifelines.exceptions import ConvergenceError
@@ -48,6 +35,28 @@ try:
 except Exception:
     HAVE_XGB = False
 
+# Optional: tifffile, imageio, openslide for robust TIFF loading
+HAVE_TIFFFILE = False
+try:
+    import tifffile as tiff
+    HAVE_TIFFFILE = True
+except Exception:
+    HAVE_TIFFFILE = False
+
+HAVE_IMAGEIO = False
+try:
+    import imageio.v3 as iio
+    HAVE_IMAGEIO = True
+except Exception:
+    HAVE_IMAGEIO = False
+
+HAVE_OPENSLIDE = False
+try:
+    import openslide  # type: ignore
+    HAVE_OPENSLIDE = True
+except Exception:
+    HAVE_OPENSLIDE = False
+
 # ---------------- Metrics ----------------
 def _cindex_numpy(durations, predictions, events):
     durations = np.asarray(durations, dtype=float)
@@ -58,7 +67,7 @@ def _cindex_numpy(durations, predictions, events):
         for j in range(i + 1, n):
             ti, tj = durations[i], durations[j]
             ei, ej = events[i], events[j]
-            if ti == tj and ei == ej == 0:  # both censored with same time -> skip
+            if ti == tj and ei == ej == 0:
                 continue
             if ti < tj and ei == 1:
                 den += 1
@@ -83,11 +92,10 @@ def tiny_jitter(x, eps=1e-6):
     rng = np.random.default_rng(42)
     return x + rng.normal(0, eps * s, size=len(x))
 
-# ---------------- Features ----------------
+# ---------------- Feature selection & preprocessing ----------------
 REQ_LABELS = ('patient_id', 'duration', 'event')
 
 def select_features(train: pd.DataFrame, test: pd.DataFrame, min_non_null: int = 5):
-    # Only use columns that exist in BOTH train and test (and aren't labels)
     common = [c for c in train.columns if c in test.columns and c not in REQ_LABELS]
     dropped_low_count = []; kept = []
     for c in common:
@@ -95,7 +103,6 @@ def select_features(train: pd.DataFrame, test: pd.DataFrame, min_non_null: int =
             dropped_low_count.append(c)
         else:
             kept.append(c)
-    # Pandas-aware dtype checks (handles categoricals)
     num_cols = [c for c in kept if is_numeric_dtype(train[c]) or is_bool_dtype(train[c])]
     cat_cols = [c for c in kept if c not in num_cols]
     return num_cols, cat_cols, {
@@ -128,7 +135,6 @@ def cv_target_encode(df_train: pd.DataFrame, df_test: pd.DataFrame,
                      cat_cols: List[str],
                      duration_col="duration", event_col="event",
                      n_splits=5, m_smooth=10.0, seed=42):
-    """Leak-safe OOF target encoding for high-cardinality categoricals."""
     if not cat_cols:
         return df_train, df_test, []
     te_cols_all = []
@@ -140,7 +146,7 @@ def cv_target_encode(df_train: pd.DataFrame, df_test: pd.DataFrame,
     X_train = df_train.copy(); X_test = df_test.copy()
 
     for col in cat_cols:
-        if df_train[col].nunique() < 8:  # let OHE handle small cardinality
+        if df_train[col].nunique() < 8:
             continue
         te_name = f"te_{col}"
         te_cols_all.append(te_name)
@@ -174,6 +180,241 @@ def cv_target_encode(df_train: pd.DataFrame, df_test: pd.DataFrame,
 
     return X_train, X_test, te_cols_all
 
+# ---------------- Robust image loading & features ----------------
+# Helper function for array-based loaders (tifffile, imageio)
+def _rescale_to_uint8(arr: np.ndarray) -> np.ndarray:
+    """Scales a numpy array to 8-bit unsigned integer (0-255)."""
+    dtype = arr.dtype
+    if dtype in (np.uint8, np.int8):
+        return arr
+    
+    # Scale based on min/max of the data, otherwise use dtype max
+    arr_min = arr.min()
+    arr_max = arr.max()
+    
+    if arr_max == arr_min:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    arr = (arr - arr_min) / (arr_max - arr_min) * 255
+    return arr.astype(np.uint8)
+
+# The updated, robust TIFF loading function
+# The updated, robust TIFF loading function
+def read_tiff_any(path: Path, max_dim: int = 12000) -> Optional[Image.Image]:
+    """
+    Robustly reads a TIFF image using openslide, tifffile, or imageio.
+    Returns None if all fail (clean skip).
+    """
+    # Import checks (assuming HAVE_OPENSLIDE, HAVE_TIFFFILE, HAVE_IMAGEIO are defined globally)
+    global HAVE_OPENSLIDE, HAVE_TIFFFILE, HAVE_IMAGEIO
+    
+    # 1. OpenSlide for WSI
+    if HAVE_OPENSLIDE:
+        try:
+            import openslide
+            slide = openslide.OpenSlide(str(path))
+            w, h = slide.dimensions
+            scale = max(w, h) / float(max_dim) if max(w,h) > max_dim else 1.0
+            img = slide.get_thumbnail((int(w/scale), int(h/scale))).convert("RGB")
+            if image is None:
+            # If the file was unreadable and read_tiff_any returned None, 
+            # we skip this file/row entirely.
+            if args.verbose:
+                warnings.warn(f"Skipping row due to unreadable image: {image_path.name}")
+            continue # Use 'continue' if inside a loop over rows/images
+        else:
+            # ONLY if image is a valid object, proceed with processing
+            resized_image = image.convert("RGB")
+            # ... rest of your feature extraction code
+            slide.close()
+            return img
+        except Exception: 
+            pass 
+            
+    # 2. Tifffile (Most reliable for general TIFFs)
+    if HAVE_TIFFFILE:
+        try:
+            import tifffile as tiff
+            arr = tiff.imread(str(path)) 
+            
+            # Handle array structure 
+            if arr.ndim > 4: arr = arr.squeeze()
+            if arr.ndim == 4 and arr.shape[0] == 1: arr = arr[0]
+            if arr.ndim == 3 and arr.shape[-1] not in (3,4): arr = arr[0]
+            
+            if arr.ndim < 2: 
+                raise ValueError("Tifffile returned an array with insufficient dimensions.")
+            
+            # Rescale and convert to PIL image
+            if arr.dtype != np.uint8: arr = _rescale_to_uint8(arr)
+            img = Image.fromarray(arr).convert("RGB")
+            img.thumbnail((max_dim, max_dim))
+            return img
+        except Exception: 
+            pass 
+
+    # 3. ImageIO (General I/O)
+    if HAVE_IMAGEIO:
+        try:
+            import imageio.v3 as iio
+            arr = iio.imread(str(path))
+            # Basic array handling for ImageIO
+            if arr.ndim > 3: arr = arr.squeeze()
+            if arr.ndim == 3 and arr.shape[-1] not in (3,4): arr = arr[0]
+
+            if arr.dtype != np.uint8: arr = _rescale_to_uint8(arr)
+            img = Image.fromarray(arr).convert("RGB")
+            img.thumbnail((max_dim, max_dim))
+            return img
+        except Exception:
+            pass 
+
+    # If all loaders fail, return None and issue a general warning
+    warnings.warn(f"Image fail for {path.name}: All loaders failed. Skipping.")
+    return None
+
+def hsv_tissue_mask(img: Image.Image) -> np.ndarray:
+    hsv = img.convert("HSV")
+    s = np.asarray(hsv.getchannel("S"), dtype=np.uint8)
+    hist, _ = np.histogram(s, bins=256, range=(0,255))
+    cdf = hist.cumsum(); total = cdf[-1]
+    sumB = wB = 0.0; maximum = 0.0; threshold = 0
+    sum1 = np.dot(np.arange(256), hist)
+    for t in range(256):
+        wB += hist[t]
+        if wB == 0: continue
+        wF = total - wB
+        if wF == 0: break
+        sumB += t * hist[t]
+        mB = sumB / wB; mF = (sum1 - sumB) / wF
+        between = wB * wF * (mB - mF) ** 2
+        if between > maximum:
+            maximum = between; threshold = t
+    mask = (s > threshold).astype(np.uint8)
+    mask = binary_opening(mask, structure=np.ones((3,3))).astype(np.uint8)
+    mask = binary_closing(mask, structure=np.ones((3,3))).astype(np.uint8)
+    return mask
+
+def tile_generator(img: Image.Image, tile_size=512, stride=256):
+    W, H = img.size
+    for y in range(0, H - tile_size + 1, stride):
+        for x in range(0, W - tile_size + 1, stride):
+            yield x, y, img.crop((x, y, x+tile_size, y+tile_size))
+
+def tile_features(tile: Image.Image, tissue_mask_tile: Optional[np.ndarray]) -> Dict[str, float]:
+    feats: Dict[str, float] = {}
+    rgb = tile.convert("RGB")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    gray = np.asarray(ImageOps.grayscale(rgb), dtype=np.uint8)
+    if tissue_mask_tile is None: tm = np.ones(gray.shape, dtype=bool)
+    else:
+        tm = tissue_mask_tile.astype(bool)
+        if tm.mean() < 0.05: return {"skip": 1.0}
+    for i, cname in enumerate(["r","g","b"]):
+        c = arr[..., i][tm]; 
+        if c.size == 0: c = np.array([0], dtype=np.uint8)
+        feats[f"t_{cname}_mean"] = float(np.mean(c))
+        feats[f"t_{cname}_std"]  = float(np.std(c))
+        for p in (5,25,50,75,95):
+            feats[f"t_{cname}_p{p}"] = float(np.percentile(c, p))
+    grayf = gray.astype(np.float32)
+    gx = np.zeros_like(grayf); gy = np.zeros_like(grayf)
+    gx[:,1:-1] = (grayf[:,2:] - grayf[:,:-2]) * 0.5
+    gy[1:-1,:] = (grayf[2:,:] - grayf[:-2,:]) * 0.5
+    mag = np.hypot(gx, gy)[tm]
+    feats["t_edge_density"] = float((mag > np.percentile(mag, 90)).mean()) if mag.size else 0.0
+    lap = (-grayf[:-2,1:-1] - grayf[2:,1:-1] - grayf[1:-1,:-2] - grayf[1:-1,2:] + 4*grayf[1:-1,1:-1])
+    feats["t_laplacian_var"] = float(np.var(lap))
+    lbp = local_binary_pattern(gray, P=8, R=1, method="uniform")[tm]
+    hist, _ = np.histogram(lbp, bins=np.arange(0, 10+1), range=(0,10), density=True)
+    for i, h in enumerate(hist): feats[f"t_lbp_u{i:02d}"] = float(h)
+    gl = (gray / 4).astype(np.uint8)
+    if tm.mean() > 0.2:
+        distances = [1, 3]; angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+        gco = graycomatrix(gl, distances=distances, angles=angles, levels=64, symmetric=True, normed=True)
+        for prop in ["contrast","dissimilarity","homogeneity","ASM","energy","correlation"]:
+            vals = graycoprops(gco, prop).ravel()
+            feats[f"t_glcm_{prop}_mean"] = float(np.mean(vals))
+            feats[f"t_glcm_{prop}_p90"] = float(np.percentile(vals, 90))
+    return feats
+
+def variance_score_for_tile_feats(r: Dict[str,float]) -> float:
+    s = 0.0
+    for k in ["t_r_std","t_g_std","t_b_std","t_laplacian_var","t_glcm_contrast_mean"]:
+        s += float(r.get(k, 0.0))
+    return s
+
+def aggregate_tile_features(rows, keep_top:int=None):
+    rows_noskip = [r for r in rows if "skip" not in r]
+    if not rows_noskip: return {}, []
+    idx = np.arange(len(rows_noskip))
+    if keep_top and keep_top > 0 and len(rows_noskip) > keep_top:
+        scores = np.array([variance_score_for_tile_feats(r) for r in rows_noskip])
+        order = np.argsort(scores)[::-1][:keep_top]
+        rows_used = [rows_noskip[i] for i in order]; used_idx = order.tolist()
+    else:
+        rows_used = rows_noskip; used_idx = idx.tolist()
+    keys = sorted({k for r in rows_used for k in r.keys()})
+    agg = {}
+    for k in keys:
+        vals = np.array([r.get(k, np.nan) for r in rows_used], dtype=float)
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0: continue
+        agg[f"wsi_{k}_mean"] = float(np.mean(vals))
+        agg[f"wsi_{k}_p90"] = float(np.percentile(vals, 90))
+    agg["wsi_tiles_used"] = float(len(rows_used))
+    return agg, used_idx
+
+def build_wsi_feature_row(img_path: Path, max_dim: int, tile_size: int, stride: int, max_tiles: int) -> Dict[str, float]:
+    img = read_tiff_any(img_path, max_dim=max_dim)
+    mask = hsv_tissue_mask(img)
+    rows = []
+    for x, y, tile in tile_generator(img, tile_size=tile_size, stride=stride):
+        tm = mask[y:y+tile_size, x:x+tile_size]
+        feats = tile_features(tile, tm)
+        if feats.get("skip", 0.0) == 1.0: continue
+        rows.append(feats)
+    agg_feats, used_idx = aggregate_tile_features(rows, keep_top=max_tiles)
+    return agg_feats
+
+def build_image_feature_table(images_dir: Path, csv_df: pd.DataFrame,
+                              image_exts=("tif","tiff"),
+                              max_dim: int = 12000, tile_size: int = 512,
+                              stride: int = 256, max_tiles: int = 600,
+                              verbose: bool=True) -> pd.DataFrame:
+    if not images_dir.exists():
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+    valid_ids = set(csv_df["patient_id"].astype(str).values.tolist())
+    rows = []; files = []
+    for ext in image_exts:
+        files += list(images_dir.glob(f"*.{ext}"))
+        files += list(images_dir.glob(f"*.{ext.upper()}"))
+    files = sorted(set(files), key=lambda p: p.name)
+    if verbose:
+        print(f"[WSI] Scanning {images_dir} ... found {len(files)} files (tif/tiff)")
+        ex = [str(p) for p in files[:3]]
+        print(f"[WSI] examples: {ex}")
+    n_used = 0; n_skipped = 0; n_error = 0
+    for p in files:
+        pid = p.stem
+        if pid not in valid_ids:
+            n_skipped += 1
+            continue
+        try:
+            feats = build_wsi_feature_row(p, max_dim=max_dim, tile_size=tile_size, stride=stride, max_tiles=max_tiles)
+            feats["patient_id"] = pid
+            rows.append(feats)
+            n_used += 1
+            if verbose and n_used <= 5:
+                print(f"[DEBUG] + image OK for {pid}: {p.name}")
+        except Exception as e:
+            n_error += 1
+            if verbose:
+                print(f"[WARN] image fail for {pid} at {p.name}: {repr(e)}")
+    if verbose:
+        print(f"[WSI] summary: used={n_used}, skipped(no csv match)={n_skipped}, error={n_error}")
+    return pd.DataFrame(rows)
+
 # ---------------- Cox dimension reducer ----------------
 class CoxFeatureReducer:
     def __init__(self, corr_thresh=0.95, var_tol=1e-12, pca_var=0.95, pca_cap=128, random_state=42):
@@ -193,7 +434,6 @@ class CoxFeatureReducer:
         keep = std[std > self.var_tol].index.tolist()
         X1 = X[keep].copy()
 
-        # Drop duplicate columns (hash-based)
         if X1.shape[1] > 1:
             hashes = X1.apply(lambda s: pd.util.hash_pandas_object(s, index=False).sum())
             _, idx = np.unique(hashes.values, return_index=True)
@@ -201,7 +441,6 @@ class CoxFeatureReducer:
 
         self.keep_lowvardup_cols = X1.columns.tolist()
 
-        # Drop highly correlated columns
         if X1.shape[1] > 1:
             c = X1.corr(numeric_only=True).abs()
             upper = c.where(np.triu(np.ones(c.shape), k=1).astype(bool))
@@ -211,7 +450,6 @@ class CoxFeatureReducer:
             X2 = X1
         self.keep_corr_cols = X2.columns.tolist()
 
-        # PCA to 95% var with cap
         n_cap = min(self.pca_cap, X2.shape[1], max(1, X2.shape[0]-1))
         self.pca = PCA(n_components=0.95, svd_solver="full", random_state=self.random_state)
         Z = self.pca.fit_transform(X2)
@@ -251,7 +489,6 @@ def fit_coxph_robust(X_df, durations, events):
                     continue
                 except Exception:
                     break
-    # Fallback pseudo-cox
     ridge = Ridge(alpha=1.0, random_state=42).fit(Z, np.log1p(durations))
     class _PseudoCox:
         def __init__(self, model): self.model = model
@@ -262,7 +499,7 @@ def fit_coxph_robust(X_df, durations, events):
 
 def pred_coxph(model, Z_df):
     risk = model.predict_partial_hazard(Z_df).values.reshape(-1)
-    return -risk  # lower = longer survival
+    return -risk
 
 # ---------------- Models ----------------
 def make_rank_groups(durations):
@@ -368,7 +605,6 @@ def stacked_cv_predict(X_full, durations, events, X_test_full, folds=5):
             fold_va.append(pred_xgb_aft_ensemble(aft_models, Xva))
             fold_te.append(pred_xgb_aft_ensemble(aft_models, X_test_full))
 
-        # CoxPH (on reduced features)
         cols = [f"f{i}" for i in range(Xtr.shape[1])]
         Xtr_df = pd.DataFrame(Xtr, columns=cols)
         Xva_df = pd.DataFrame(Xva, columns=cols)
@@ -402,14 +638,12 @@ def _t(): return time.perf_counter()
 
 def augment_clinical_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # Age bins + squared (if 'age_at_diagnosis' present)
     for col in ["age_at_diagnosis", "age", "Age", "patient_age", "PatientAge"]:
         if col in out.columns:
             a = pd.to_numeric(out[col], errors="coerce")
             out["age_bin"] = pd.cut(a, bins=[0,40,60,80,200], labels=["<=40","40-60","60-80","80+"], include_lowest=True)
             out["age_sq"] = a**2
             break
-    # Interactions if available
     def maybe_interact(a, b, name):
         if a in out.columns and b in out.columns:
             out[name] = out[a].astype(str) + "_" + out[b].astype(str)
@@ -420,14 +654,13 @@ def augment_clinical_features(df: pd.DataFrame) -> pd.DataFrame:
 def train_and_predict(train_path: Path, test_path: Path,
                       out_path: Path, folds: int = 5, max_rows: Optional[int] = None,
                       save_dir: Optional[Path] = None, min_non_null: int = 5,
-                      use_images: bool = False, verbose: bool = False) -> Dict[str, Any]:
+                      verbose: bool = True) -> Dict[str, Any]:
 
     t0 = _t()
     train = load_csv(train_path, max_rows)
     test  = load_csv(test_path, None)
     if verbose: print(f"[TIMING] load_csv: {(_t()-t0):.2f}s")
 
-    # Map labels if dataset uses alternative names
     rename_map = {}
     if "overall_survival_days" in train.columns:
         rename_map["overall_survival_days"] = "duration"
@@ -436,68 +669,65 @@ def train_and_predict(train_path: Path, test_path: Path,
     if rename_map:
         train = train.rename(columns=rename_map)
 
-    # Required columns
     for col in REQ_LABELS:
         if col not in train.columns:
             raise ValueError(f"Missing required column '{col}' in {train_path}")
 
-    # Ensure patient_id is treated as string (official IDs)
     train["patient_id"] = train["patient_id"].astype(str)
     test["patient_id"]  = test["patient_id"].astype(str)
 
-    # Augment clinical features
     t1 = _t()
     train = augment_clinical_features(train)
     test  = augment_clinical_features(test)
     if verbose: print(f"[TIMING] augment_clinical: {(_t()-t1):.2f}s")
 
-    # Select features that appear in both
+    train_img_dir = train_path.parent / "images"
+    test_img_dir  = test_path.parent  / "images"
+    if verbose:
+        print(f"[WSI] train images dir: {train_img_dir}")
+        print(f"[WSI] test  images dir: {test_img_dir}")
+    tr_img_df = build_image_feature_table(train_img_dir, train, verbose=verbose)
+    te_img_df = build_image_feature_table(test_img_dir,  test,  verbose=verbose)
+    if verbose:
+        print(f"[WSI] train image features shape: {tr_img_df.shape}")
+        print(f"[WSI] test  image features shape: {te_img_df.shape}")
+    train = train.merge(tr_img_df, on="patient_id", how="left")
+    test  = test.merge(te_img_df,  on="patient_id", how="left")
+
     num_cols0, cat_cols0, _ = select_features(train, test, min_non_null=min_non_null)
 
-    # CV target encoding for high-cardinality text
     t2 = _t()
     train_te, test_te, te_cols = cv_target_encode(train.copy(), test.copy(), cat_cols0, n_splits=folds)
     train = train_te; test = test_te
     if verbose: print(f"[TIMING] target_encoding: {(_t()-t2):.2f}s; te_cols={len(te_cols)}")
 
-    # (Intentionally) skip image features unless explicitly requested
-    if use_images and verbose:
-        print("[WSI] --use-images is True, but images were reported missing; skipping image features safely.")
-
-    # Final feature selection (post TE)
     num_cols, cat_cols, _ = select_features(train, test, min_non_null=min_non_null)
     if not (num_cols or cat_cols):
         raise ValueError("No usable features after filtering. Consider lowering --min-non-null.")
 
-    # Preprocess
     pre = build_preprocessor(num_cols, cat_cols)
     t3 = _t()
     Xt = pre.fit_transform(train)
     Xs = pre.transform(test)
     if verbose: print(f"[TIMING] preprocess+transform: {(_t()-t3):.2f}s; Xt_shape={getattr(Xt,'shape',None)}")
 
-    # Targets
     y_time = train["duration"].values.astype(float)
     y_event = train["event"].values.astype(int)
 
-    # Stacked models
     t4 = _t()
     oof, te, blender = stacked_cv_predict(Xt, y_time, y_event, Xs, folds=folds)
     if verbose: print(f"[TIMING] stacked_models: {(_t()-t4):.2f}s")
     cv_c = concordance_index(y_time, oof, y_event)
 
-    # Submission (rank-normalized)
     sub = pd.DataFrame({"patient_id": test["patient_id"].values, "predicted_scores": te})
     ranks = sub["predicted_scores"].rank(method="average") - 1
     sub["predicted_scores"] = ranks / max(1, ranks.max())
 
-    # Save to current working directory
     t5 = _t()
     out_path = Path(out_path)
     sub.to_csv(out_path, index=False)
     if verbose: print(f"[TIMING] save_csv: {(_t()-t5):.2f}s")
 
-    # Optionally save artifacts
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
         joblib.dump({"pre": pre, "blender": blender}, Path(save_dir) / "model.joblib")
@@ -518,16 +748,15 @@ def train_and_predict(train_path: Path, test_path: Path,
 
 # ---------------- CLI ----------------
 def build_argparser():
-    p = argparse.ArgumentParser(description="survival_hackathon_rev2.py (tabular-only by default).")
+    p = argparse.ArgumentParser(description="survival_hackathon_rev2.py (always uses images; reverse match).")
     p.add_argument("--data-dir", type=str, required=True, help="Root with train/ and test/ subfolders.")
     p.add_argument("--train", type=str, default="train/train.csv", help="train.csv path (relative to data-dir).")
     p.add_argument("--test", type=str, default="test/test.csv", help="test.csv path (relative to data-dir).")
-    p.add_argument("--out", type=str, default="predictions.csv", help="Output CSV filename (saved to CWD).")
+    p.add_argument("--out", type=str, default="predictions.csv", help="Output predictions CSV (saved to CWD).")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--max-rows", type=int, default=None)
     p.add_argument("--save-dir", type=str, default=None, help="Folder to store artifacts.")
     p.add_argument("--min-non-null", type=int, default=5, help="Drop cols with < this many non-null in train.")
-    p.add_argument("--use-images", action="store_true", help="Try to use image features (off by default).")
     p.add_argument("--verbose", action="store_true", help="Print timings and diagnostics.")
     return p
 
@@ -545,7 +774,7 @@ def main():
     info = train_and_predict(train_path, test_path, out_path,
                              folds=args.folds, max_rows=args.max_rows,
                              save_dir=save_dir, min_non_null=args.min_non_null,
-                             use_images=args.use_images, verbose=args.verbose)
+                             verbose=args.verbose)
     print(json.dumps(info, indent=2))
 
 if __name__ == "__main__":

@@ -21,3 +21,4 @@ tifffile
 imageio
 scikit-image
 scipy
+openslide-python
