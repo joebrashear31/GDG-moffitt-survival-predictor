@@ -10,9 +10,19 @@ from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import VarianceThreshold
 from sksurv.metrics import concordance_index_censored
 from sksurv.linear_model import CoxnetSurvivalAnalysis 
+from sklearn.base import TransformerMixin, BaseEstimator
 
 # Define list of strings to treat as NaN during load
 NAN_VALUES = ['NX', 'NA', 'N/A', 'NaN', 'None', '?']
+
+# Custom transformer to explicitly convert sparse matrices to dense NumPy arrays
+class DenseTransformer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        if hasattr(X, "toarray"):
+            return X.toarray()
+        return X
 
 # --- 1. Feature Engineering Function ---
 def feature_engineer(X: pd.DataFrame) -> pd.DataFrame:
@@ -33,7 +43,7 @@ def feature_engineer(X: pd.DataFrame) -> pd.DataFrame:
     return X_out
 
 # --- 2. Data Loading and Merging Function ---
-def load_data(data_dir, data_type='train'):
+def load_and_merge_data(data_dir, data_type='train'):
     """Loads, merges clinical and image features, and preprocesses survival outcome."""
     
     CLINICAL_FILE = os.path.join(data_dir, data_type, f'{data_type}.csv')
@@ -41,6 +51,10 @@ def load_data(data_dir, data_type='train'):
 
     clinical_df = pd.read_csv(CLINICAL_FILE, na_values=NAN_VALUES)
     clinical_df.columns = clinical_df.columns.str.lower().str.replace(' ', '_').str.strip()
+
+    # Text data must be string for the text pipeline
+    if 'pathology_report' in clinical_df.columns:
+        clinical_df['pathology_report'] = clinical_df['pathology_report'].astype(str)
 
     image_df = pd.read_csv(IMAGE_FILE)
     image_df.columns = image_df.columns.str.lower().str.replace(' ', '_').str.strip()
@@ -62,7 +76,9 @@ def load_data(data_dir, data_type='train'):
         ], dtype=[('event', 'bool'), ('time', 'float64')])
         
         X = X.drop(columns=['overall_survival_days', 'overall_survival_event',
-                            'days_to_death', 'days_to_last_followup', 'cause_of_death'])
+                            'days_to_death', 'days_to_last_followup', 'cause_of_death',
+                            'days_to_progression', 'days_to_recurrence', 
+                            'progression_or_recurrence', 'vital_status'], errors='ignore')
         return X, y, image_features
     else:
         X = X.drop(columns=[col for col in ['overall_survival_days', 'overall_survival_event'] if col in X.columns], errors='ignore')
@@ -97,7 +113,7 @@ def get_preprocessor(image_features):
 
     cat_pipeline = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False, drop='first'))
     ])
 
     text_pipeline = Pipeline(steps=[
@@ -114,20 +130,20 @@ def get_preprocessor(image_features):
             ('cat', cat_pipeline, CATEGORICAL_COLS + NEW_CAT_COLS),
             ('text', text_pipeline, TEXT_COL) 
         ],
-        remainder='drop', # Excludes patient_id
+        remainder='drop',
     )
     
     return preprocessor
 
 # --- 4. Main Model Pipeline ---
 def get_model_pipeline(preprocessor):
-    """Defines the final machine learning pipeline using Coxnet (Maximum Forced Regularization)."""
+    """Defines the final machine learning pipeline using Coxnet (Fixed Alpha Stability)."""
     
-    # FINAL FIX: Force the regularization penalty (alpha) to be extremely strong
+    # FINAL ATTEMPT: Fixed, weaker Alpha (inspired by rev3) + 5% Ridge stability
     coxnet_model = CoxnetSurvivalAnalysis(
-        l1_ratio=0.999999,           # Maximum Sparsity/Lasso 
-        alpha_min_ratio=0.1,         # CRITICAL: Force the CV to search for a much stronger penalty
-        n_alphas=100,                
+        l1_ratio=0.95,               # 95% Lasso (Selection) + 5% Ridge (Stability)
+        alphas=[0.01],               # Fixed, much weaker Alpha to allow multimodal features to contribute
+        n_alphas=1,                  
         fit_baseline_model=True,     
         max_iter=10000,
         tol=1e-7,
@@ -135,6 +151,7 @@ def get_model_pipeline(preprocessor):
 
     model_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor),
+        ('to_dense', DenseTransformer()), 
         ('model', coxnet_model)
     ])
     
@@ -144,11 +161,11 @@ def get_model_pipeline(preprocessor):
 def main(data_dir):
     """Loads data, trains the model, and generates a submission file."""
     
-    OUTPUT_FILE = 'survival_hackathon_submission_rev22_Max_Forced_Reg.csv'
+    OUTPUT_FILE = 'survival_hackathon_submission_rev26_Fixed_Alpha_Stability.csv'
 
     print("📚 Loading and Merging Multimodal Data (Clinical + Image)...")
-    X_train_raw, y_train, train_image_features = load_data(data_dir, data_type='train')
-    X_test_raw, test_image_features = load_data(data_dir, data_type='test')
+    X_train_raw, y_train, train_image_features = load_and_merge_data(data_dir, data_type='train')
+    X_test_raw, test_image_features = load_and_merge_data(data_dir, data_type='test')
     
     print("🔧 Running Feature Engineering...")
     X_train = feature_engineer(X_train_raw)
@@ -160,7 +177,7 @@ def main(data_dir):
     preprocessor = get_preprocessor(image_features_to_use)
     model_pipeline = get_model_pipeline(preprocessor)
     
-    print(f"\n📈 Training Coxnet Max Forced Reg Model (alpha_min_ratio=0.1) to combat extreme overfitting...")
+    print(f"\n📈 Training Coxnet FINAL STABILITY Model (l1_ratio=0.95, fixed alphas=[0.01])...")
     model_pipeline.fit(X_train, y_train) 
     print("✅ Model trained successfully.")
 
@@ -169,7 +186,7 @@ def main(data_dir):
     c_index_estimate = concordance_index_censored(y_train['event'], y_train['time'], train_risk_scores)
 
     print(f"\n=================================================================")
-    print(f"⭐️ LOCAL TRAINING C-INDEX (Maximum Forced Regularization): {c_index_estimate[0]:.4f}")
+    print(f"⭐️ LOCAL TRAINING C-INDEX (Fixed Alpha Stability): {c_index_estimate[0]:.4f}")
     print(f"=================================================================")
     
     # --- 3. Generate Predictions and Save Submission ---
@@ -185,7 +202,7 @@ def main(data_dir):
 
     submission_df.to_csv(OUTPUT_FILE, index=False)
 
-    print(f"\n✅ Submission file generated: {OUTPUT_FILE}. This highly restricted model should finally generalize well.")
+    print(f"\n✅ Submission file generated: {OUTPUT_FILE}. This is your final, most stable attempt.")
 
 # --- Set Submission URL ---
 submission_url = "https://huggingface.co/spaces/Lab-Rasool/2025-hackathon-submission"

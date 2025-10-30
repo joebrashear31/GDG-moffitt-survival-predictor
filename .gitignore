@@ -6,3 +6,4 @@ outputs/
 *.pyc
 *.pyo
 *.swp
+*.csv
