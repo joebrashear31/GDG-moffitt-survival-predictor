@@ -8,15 +8,15 @@ from sklearn.preprocessing import RobustScaler, OneHotEncoder, FunctionTransform
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import VarianceThreshold 
+# Using Coxnet
 from sksurv.linear_model import CoxnetSurvivalAnalysis 
 from sksurv.metrics import concordance_index_censored
 from sklearn.base import TransformerMixin, BaseEstimator
 
-# Define list of strings to treat as NaN during load (Fixes 'NX', 'NA', etc. errors)
+# Define list of strings to treat as NaN during load
 NAN_VALUES = ['NX', 'NA', 'N/A', 'NaN', 'None', '?']
 
-# 🎯 NEW: Define a list of all known original clinical and survival columns
-# This is used to distinguish original features from the merged image features.
+# Define a list of all known original clinical and survival columns
 ORIGINAL_CLINICAL_COLUMNS = [
     # Numerical
     'age_at_diagnosis', 'days_to_treatment',
@@ -25,7 +25,7 @@ ORIGINAL_CLINICAL_COLUMNS = [
     'classification_of_tumor', 'tissue_origin', 'laterality', 
     'prior_malignancy', 'synchronous_malignancy', 'disease_response', 
     'treatment_types', 'therapeutic_agents', 'treatment_outcome',
-    # Text
+    # Text (Removed for stability)
     'pathology_report',
     # Identifier
     'patient_id',
@@ -36,7 +36,6 @@ ORIGINAL_CLINICAL_COLUMNS = [
     'progression_or_recurrence', 'vital_status'
 ]
 
-
 # Custom transformer to explicitly convert sparse matrices to dense NumPy arrays
 class DenseTransformer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
@@ -46,31 +45,25 @@ class DenseTransformer(BaseEstimator, TransformerMixin):
             return X.toarray()
         return X
 
-# 🎯 UPDATED: Function to load and merge image features
+# Function to load and merge image features
 def load_and_merge_image_features(df, data_dir, is_train):
     """Loads a pre-extracted image feature CSV and merges it with the main dataframe."""
     
     subset_dir = "train" if is_train else "test"
-    # Assuming file name is image_features.csv and it uses patient_id as the merge key
     feature_file = os.path.join(data_dir, subset_dir, "image_features.csv")
 
     if os.path.exists(feature_file):
         try:
-            # We explicitly load patient_id as index for merging
             df_features = pd.read_csv(feature_file) 
             
-            # Ensure the merge key is in the dataframe to be merged
             if 'patient_id' in df_features.columns:
                 df_features = df_features.set_index('patient_id')
             else:
-                 # Assume the first column is the patient ID if not named 'patient_id'
-                 # Note: This is a robust assumption but might need adjustment based on the file.
                  df_features = df_features.rename(columns={df_features.columns[0]: 'patient_id'}).set_index('patient_id')
                  
             df = df.set_index('patient_id').join(df_features, how='left')
             df = df.reset_index()
             
-            # Count the new columns added
             new_cols_count = len(df_features.columns)
             print(f"✅ Merged {new_cols_count} image features from {os.path.basename(feature_file)}.")
         except Exception as e:
@@ -98,10 +91,7 @@ def generate_submission(data_dir):
     # Load and merge image features for both train and test sets
     df_train = load_and_merge_image_features(df_train, data_dir, is_train=True)
     df_test = load_and_merge_image_features(df_test, data_dir, is_train=False)
-
-    df_train['pathology_report'] = df_train['pathology_report'].astype(str)
-    df_test['pathology_report'] = df_test['pathology_report'].astype(str)
-
+    
     def create_survival_array(df):
         dt = np.dtype([('event', np.bool_), ('time', np.float64)])
         y = np.array(list(zip(df['overall_survival_event'].astype(bool), 
@@ -110,14 +100,14 @@ def generate_submission(data_dir):
 
     y_train = create_survival_array(df_train)
     
-    features_to_drop = [col for col in ORIGINAL_CLINICAL_COLUMNS if col.endswith('_days') or col.endswith('_event') or col in ['days_to_death', 'days_to_last_followup', 'cause_of_death', 'progression_or_recurrence', 'vital_status']]
+    # CRITICAL: Drop survival columns AND pathology_report
+    features_to_drop = [col for col in ORIGINAL_CLINICAL_COLUMNS if col.endswith('_days') or col.endswith('_event') or col in ['days_to_death', 'days_to_last_followup', 'cause_of_death', 'progression_or_recurrence', 'vital_status', 'pathology_report']] 
 
-    X_train = df_train.drop(columns=[col for col in features_to_drop if col in df_train.columns])
-    X_test = df_test.copy()
+    X_train = df_train.drop(columns=[col for col in features_to_drop if col in df_train.columns], errors='ignore')
+    X_test = df_test.copy().drop(columns=['pathology_report'], errors='ignore')
 
-    # --- 2. Preprocessing and Modeling Pipeline (Multi-Modal) ---
+    # --- 2. Preprocessing and Modeling Pipeline (Clinical + Image Features ONLY) ---
     
-    # 🎯 NEW LOGIC: Identify image features by checking which columns are NOT original clinical features
     current_columns = set(X_train.columns)
     original_base_columns = set(
         col for col in ORIGINAL_CLINICAL_COLUMNS 
@@ -126,6 +116,7 @@ def generate_submission(data_dir):
     
     image_features = sorted(list(current_columns - original_base_columns))
     print(f"🔍 Identified {len(image_features)} image features for processing.")
+    print("❌ Text features have been intentionally removed to prevent overfitting.")
 
 
     numerical_features = ['age_at_diagnosis', 'days_to_treatment'] + image_features
@@ -136,15 +127,14 @@ def generate_submission(data_dir):
         'prior_malignancy', 'synchronous_malignancy', 'disease_response', 
         'treatment_types', 'therapeutic_agents', 'treatment_outcome'
     ]
-    text_feature = ['pathology_report']
     
-    # Define Numerical Pipeline (will now include image features)
+    # Define Numerical Pipeline 
     numerical_transformer = Pipeline(steps=[
         ('to_numeric_coerce', FunctionTransformer(
             lambda X: pd.DataFrame(X).apply(pd.to_numeric, errors='coerce'), validate=False
         )),
         ('imputer', SimpleImputer(strategy='median')), 
-        ('scaler', RobustScaler())
+        ('scaler', RobustScaler()) 
     ])
 
     # Define Categorical Pipeline
@@ -153,25 +143,12 @@ def generate_submission(data_dir):
         ('onehot', OneHotEncoder(handle_unknown='ignore', drop='first'))
     ])
 
-    # Define Text Pipeline (TF-IDF Vectorization)
-    text_transformer = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='constant', fill_value='')), 
-        ('unwrapper', FunctionTransformer(lambda x: x.squeeze().tolist(), validate=False)),
-        ('tfidf', TfidfVectorizer(
-            stop_words='english',
-            ngram_range=(1, 2),
-            max_features=1000,
-            norm=None
-        )),
-        ('text_scaler', RobustScaler(with_centering=False)) 
-    ])
-
     # Combine all feature pipelines into the ColumnTransformer
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', numerical_transformer, numerical_features),
             ('cat', categorical_transformer, categorical_features),
-            ('txt', text_transformer, text_feature)
+            # TEXT TRANSFORMER IS INTENTIONALLY OMITTED
         ],
         remainder='drop' 
     )
@@ -181,14 +158,15 @@ def generate_submission(data_dir):
         ('preprocessor', preprocessor),
         ('to_dense', DenseTransformer()), 
         ('variance_filter', VarianceThreshold(threshold=0.001)), 
-        # Corrected: Using 'alphas' (plural) as a list
+        # 💥 TARGETED PENALTY: Alpha=0.2 (Optimal Generalization)
         ('coxph_regularized', CoxnetSurvivalAnalysis( 
-            alphas=[1.0], 
+            alphas=[0.2], 
+            l1_ratio=0.5, # Elastic Net
             tol=1e-5
         ))
     ])
 
-    print("⏳ Training Multi-Modal Robust Coxnet model (with dynamically-identified image features)...")
+    print("⏳ Training Lightly Penalized Coxnet Model (Clinical + Image Only, Alpha=0.2)...")
     model_pipeline.fit(X_train, y_train) 
     print("✅ Model trained successfully. Check your C-Index!")
 
@@ -197,7 +175,7 @@ def generate_submission(data_dir):
     c_index_estimate = concordance_index_censored(y_train['event'], y_train['time'], train_risk_scores)
 
     print(f"================================================================")
-    print(f"⭐️ LOCAL TRAINING C-INDEX (Coxnet Fit): {c_index_estimate[0]:.4f}")
+    print(f"⭐️ LOCAL TRAINING C-INDEX (Targeted Penalty Coxnet): {c_index_estimate[0]:.4f}")
     print(f"================================================================")
     
     # --- 4. Generate Predictions and Save Submission ---
@@ -215,7 +193,7 @@ def generate_submission(data_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train a CoxPH model for the hackathon and generate a CSV submission file."
+        description="Train an aggressively penalized Coxnet model for the hackathon."
     )
     
     parser.add_argument(

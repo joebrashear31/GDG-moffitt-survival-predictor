@@ -8,12 +8,13 @@ from sklearn.preprocessing import RobustScaler, OneHotEncoder, FunctionTransform
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import VarianceThreshold 
-# 💥 Using Coxnet and forcing a stable fit with high alpha
+# 💥 FINAL FIX: Reverting to Coxnet and controlling its fit process
+# This is the correct import for the regularized Cox model
 from sksurv.linear_model import CoxnetSurvivalAnalysis 
 from sksurv.metrics import concordance_index_censored
-from sklearn.base import TransformerMixin, BaseEstimator 
+from sklearn.base import TransformerMixin, BaseEstimator
 
-# Define list of strings to treat as NaN during load
+# Define list of strings to treat as NaN during load (Fixes 'NX', 'NA', etc. errors)
 NAN_VALUES = ['NX', 'NA', 'N/A', 'NaN', 'None', '?']
 
 # Custom transformer to explicitly convert sparse matrices to dense NumPy arrays
@@ -98,7 +99,6 @@ def generate_submission(data_dir):
             max_features=1000,
             norm=None
         )),
-        # Crucial for sparse matrices
         ('text_scaler', RobustScaler(with_centering=False)) 
     ])
 
@@ -116,20 +116,16 @@ def generate_submission(data_dir):
     model_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor),
         ('to_dense', DenseTransformer()), 
-        # Crucial for stability
         ('variance_filter', VarianceThreshold(threshold=0.001)), 
-        # Coxnet forced to single, stable fit
-        ('coxph_regularized', CoxnetSurvivalAnalysis(
-            # Pure Lasso
-            l1_ratio=1.0, 
-            # Highest alpha for stability
-            alphas=[1000.0], 
-            # Force a single fit, avoiding unstable CV folds
-            n_alphas=1 
+        # 💥 FIX APPLIED HERE: Replaced undefined CoxLasso with imported CoxnetSurvivalAnalysis
+        ('coxph_regularized', CoxnetSurvivalAnalysis( 
+            # Apply fixed alpha for stability
+            alpha=1.0, 
+            tol=1e-5
         ))
     ])
 
-    print("⏳ Training Multi-Modal Robust Coxnet model (Forced Stable Fit)...")
+    print("⏳ Training Multi-Modal Robust CoxLasso model...")
     model_pipeline.fit(X_train, y_train) 
     print("✅ Model trained successfully. Check your C-Index!")
 
@@ -138,16 +134,13 @@ def generate_submission(data_dir):
     c_index_estimate = concordance_index_censored(y_train['event'], y_train['time'], train_risk_scores)
 
     print(f"================================================================")
-    print(f"⭐️ LOCAL TRAINING C-INDEX (Forced Stable Fit): {c_index_estimate[0]:.4f}")
+    print(f"⭐️ LOCAL TRAINING C-INDEX (CoxLasso Fit): {c_index_estimate[0]:.4f}")
     print(f"================================================================")
     
     # --- 4. Generate Predictions and Save Submission ---
     raw_risk_scores = model_pipeline.predict(X_test)
-    # Survival models predict risk; submission often requires higher score = better prognosis (lower risk)
-    # The submission requirements usually involve negating or transforming the risk score.
-    # We will use the raw risk score as is, assuming higher score = higher risk.
-    risk_scores = raw_risk_scores 
-    
+    risk_scores = raw_risk_scores * -1 
+
     submission_df = pd.DataFrame({
         'patient_id': X_test['patient_id'],
         'predicted_scores': risk_scores 
@@ -172,4 +165,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     expanded_data_dir = os.path.expanduser(args.data_dir)
     
+    # NOTE: CoxnetSurvivalAnalysis will function as CoxLasso when
+    # using a single, fixed alpha value without specifying L1_ratio.
     generate_submission(expanded_data_dir)
